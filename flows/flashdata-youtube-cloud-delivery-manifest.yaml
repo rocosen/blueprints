@@ -1,0 +1,402 @@
+id: flashdata-youtube-cloud-delivery-manifest
+namespace: company.research
+inputs:
+- id: resume_job_id
+  type: STRING
+  defaults: new
+  description: Use new to submit once, or an existing job_UUID to resume without another POST.
+- id: video_id
+  type: STRING
+  defaults: jNQXAC9IVRw
+  description: 'For new jobs: an 11-character video ID you have rights to download.'
+- id: start_at
+  type: STRING
+  defaults: 00:00:00
+  description: 'For new jobs: clip start in HH:MM:SS.'
+- id: end_at
+  type: STRING
+  defaults: 00:00:10
+  description: 'For new jobs: required clip end; maximum clip duration is 60 seconds in this template.'
+triggers:
+- id: weekly_research
+  type: io.kestra.plugin.core.trigger.Schedule
+  cron: 0 9 * * 1
+  timezone: UTC
+  recoverMissedSchedules: NONE
+  disabled: true
+tasks:
+- id: prepare_request
+  type: io.kestra.plugin.scripts.python.Script
+  taskRunner:
+    type: io.kestra.plugin.scripts.runner.docker.Docker
+  containerImage: python:3.13.15-slim
+  outputFiles:
+  - request.json
+  - job.json
+  script: |
+    import base64
+    import json
+    import os
+    import re
+    from pathlib import Path
+    inputs=json.loads(base64.b64decode(os.environ['INPUTS_B64']))
+    resume=inputs['resume_job_id'].strip()
+    is_resume=resume!='new'
+    if is_resume and not re.fullmatch(r'job_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',resume): raise ValueError('Use new or a valid job_UUID')
+    request={'source':'youtube_download','params':{}}
+    if not is_resume:
+        video=inputs['video_id'].strip()
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}',video): raise ValueError('Invalid video ID')
+        def seconds(name):
+            value=inputs[name]
+            if not isinstance(value,str) or not re.fullmatch(r'\d{2}:[0-5]\d:[0-5]\d',value): raise ValueError('Use HH:MM:SS')
+            h,m,s=map(int,value.split(':')); total=h*3600+m*60+s
+            if total>43200: raise ValueError('Times must be within 12 hours')
+            return total
+        duration=seconds('end_at')-seconds('start_at')
+        if not 0<duration<=60: raise ValueError('Clip must last 1–60 seconds')
+        request.update(video_id=video,params={'download_type':'audio_video','video_quality':'<=360','output_format':'mp4','start_at':inputs['start_at'],'end_at':inputs['end_at']})
+    Path('request.json').write_text(json.dumps(request),encoding='utf-8')
+    Path('job.json').write_text(json.dumps({'id':resume} if is_resume else {}),encoding='utf-8')
+    print('::'+json.dumps({'outputs':{'resume':is_resume}},separators=(',',':'))+'::')
+  env:
+    INPUTS_B64: '{{ {''resume_job_id'': inputs.resume_job_id, ''video_id'': inputs.video_id, ''start_at'': inputs.start_at,
+      ''end_at'': inputs.end_at} | toJson | base64encode }}'
+- id: route_submission
+  type: io.kestra.plugin.core.flow.If
+  condition: '{{ outputs.prepare_request.vars.resume == false }}'
+  then:
+  - id: submit_job
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.13.15-slim
+    inputFiles:
+      request.json: '{{ outputs.prepare_request.outputFiles[''request.json''] }}'
+    outputFiles:
+    - job.json
+    script: |
+      import gzip
+      import http.client
+      import io
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+      from pathlib import Path
+      from urllib.parse import urlsplit
+
+      LIMIT=4*1024*1024
+      key=os.environ['FLASHDATA_API_KEY']
+      if not key or len(key)>512 or any(ord(c)<33 or ord(c)>126 for c in key): raise SystemExit('Configure a valid API key secret')
+      def request_http(host,path,method='GET',body=None,authenticated=True,correlation_id=None):
+          headers={'Accept':'application/json','Accept-Encoding':'gzip'}
+          if authenticated:
+              if host not in ('api.flashdata.dev','data.flashdata.dev'): raise ValueError('Refusing credentials to another host')
+              headers['X-API-Key']=key
+              if correlation_id: headers['X-Request-Id']=correlation_id
+          if body is not None: headers['Content-Type']='application/json'
+          conn=http.client.HTTPSConnection(host,timeout=65)
+          try:
+              conn.request(method,path,body=body,headers=headers)
+              res=conn.getresponse()
+              status=res.status; location=res.getheader('Location'); encoding=res.getheader('Content-Encoding')
+              raw=res.read(LIMIT+1)
+          except (OSError,http.client.HTTPException):
+              raise SystemExit('Network outcome uncertain. Inspect the saved request/job ID and FlashData Jobs before restarting; no retry was made.') from None
+          finally: conn.close()
+          if len(raw)>LIMIT: raise ValueError('Response exceeds 4 MiB')
+          if encoding=='gzip' or raw.startswith(b'\x1f\x8b'):
+              with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream: raw=stream.read(LIMIT+1)
+              if len(raw)>LIMIT: raise ValueError('Decoded response exceeds 4 MiB')
+          return status,location,raw
+
+      def decode(raw):
+          try: return json.loads(raw)
+          except (ValueError,UnicodeDecodeError): raise ValueError('Invalid JSON response; raw body withheld') from None
+
+      def save(name,value):
+          Path(name).write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding='utf-8')
+
+      def emit(**values):
+          print('::'+json.dumps({'outputs':values},separators=(',',':'))+'::',flush=True)
+
+      def job_id(value):
+          if not isinstance(value,str) or not re.fullmatch(r'job_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value):
+              raise ValueError('Invalid job ID')
+          return value
+      import base64
+      import uuid
+      storage_raw=base64.b64decode(os.environ['STORAGE_B64'])
+      try: storage=json.loads(storage_raw)
+      except (ValueError,UnicodeDecodeError): raise ValueError('FLASHDATA_STORAGE_JSON must be a JSON object') from None
+      if not isinstance(storage,dict) or storage.get('storage_type') not in ['azure','bos','cos','gcs','oss','s3','s3_compatible','tos'] or not isinstance(storage.get('storage_url'),str) or not storage['storage_url'].strip():
+          raise ValueError('Configure the documented storage type and bucket/container')
+      # A nonempty dedicated prefix is required by this template to scope the destination.
+      prefix=storage.get('object_prefix')
+      if not isinstance(prefix,str) or not 1<=len(prefix)<=512 or any(not re.fullmatch(r'[A-Za-z0-9._-]+',p) or p in ('.','..') for p in prefix.rstrip('/').split('/')):
+          raise ValueError('Set a dedicated safe object_prefix in the storage secret')
+      request=decode(Path('request.json').read_bytes())
+      request['params']['storage']=storage
+      request_id='req_'+str(uuid.uuid4())
+      # This correlation ID survives a network failure; it is not an idempotency guarantee.
+      emit(request_id=request_id)
+      # Keep credentials only in memory; never serialize this augmented request to disk.
+      status,_,raw=request_http('data.flashdata.dev','/v1/queries','POST',json.dumps(request).encode(),correlation_id=request_id)
+      if status!=200: raise SystemExit('Download submission HTTP '+str(status)+'. No retry was made; check Jobs before submitting again.')
+      result=decode(raw)
+      if not isinstance(result,dict) or result.get('source')!='youtube_download': raise ValueError('Unexpected submission response; check Jobs before retrying')
+      identifier=job_id(result.get('id'))
+      save('job.json',{'id':identifier,'submitted_at':datetime.now(timezone.utc).isoformat(),'request_id':request_id})
+      emit(job_id=identifier)
+    env:
+      FLASHDATA_API_KEY: '{{ secret(''FLASHDATA_API_KEY'') }}'
+      STORAGE_B64: '{{ secret(''FLASHDATA_STORAGE_JSON'') | base64encode }}'
+    timeout: PT3M
+  else:
+  - id: resume_note
+    type: io.kestra.plugin.core.log.Log
+    message: Resuming an existing job; no download POST or storage secret is needed.
+- id: poll_job
+  type: io.kestra.plugin.scripts.python.Script
+  taskRunner:
+    type: io.kestra.plugin.scripts.runner.docker.Docker
+  containerImage: python:3.13.15-slim
+  inputFiles:
+    job.json: '{{ outputs.submit_job.outputFiles[''job.json''] ?? outputs.prepare_request.outputFiles[''job.json'']
+      }}'
+  outputFiles:
+  - state.json
+  script: |
+    import gzip
+    import http.client
+    import io
+    import json
+    import os
+    import re
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    LIMIT=4*1024*1024
+    key=os.environ['FLASHDATA_API_KEY']
+    if not key or len(key)>512 or any(ord(c)<33 or ord(c)>126 for c in key): raise SystemExit('Configure a valid API key secret')
+    def request_http(host,path,method='GET',body=None,authenticated=True,correlation_id=None):
+        headers={'Accept':'application/json','Accept-Encoding':'gzip'}
+        if authenticated:
+            if host not in ('api.flashdata.dev','data.flashdata.dev'): raise ValueError('Refusing credentials to another host')
+            headers['X-API-Key']=key
+            if correlation_id: headers['X-Request-Id']=correlation_id
+        if body is not None: headers['Content-Type']='application/json'
+        conn=http.client.HTTPSConnection(host,timeout=65)
+        try:
+            conn.request(method,path,body=body,headers=headers)
+            res=conn.getresponse()
+            status=res.status; location=res.getheader('Location'); encoding=res.getheader('Content-Encoding')
+            raw=res.read(LIMIT+1)
+        except (OSError,http.client.HTTPException):
+            raise SystemExit('Network outcome uncertain. Inspect the saved request/job ID and FlashData Jobs before restarting; no retry was made.') from None
+        finally: conn.close()
+        if len(raw)>LIMIT: raise ValueError('Response exceeds 4 MiB')
+        if encoding=='gzip' or raw.startswith(b'\x1f\x8b'):
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream: raw=stream.read(LIMIT+1)
+            if len(raw)>LIMIT: raise ValueError('Decoded response exceeds 4 MiB')
+        return status,location,raw
+
+    def decode(raw):
+        try: return json.loads(raw)
+        except (ValueError,UnicodeDecodeError): raise ValueError('Invalid JSON response; raw body withheld') from None
+
+    def save(name,value):
+        Path(name).write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding='utf-8')
+
+    def emit(**values):
+        print('::'+json.dumps({'outputs':values},separators=(',',':'))+'::',flush=True)
+
+    def job_id(value):
+        if not isinstance(value,str) or not re.fullmatch(r'job_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value):
+            raise ValueError('Invalid job ID')
+        return value
+    import time
+    identifier=job_id(decode(Path('job.json').read_bytes()).get('id'))
+    safe=None
+    for attempt in range(12):
+        status,_,raw=request_http('api.flashdata.dev','/v2/jobs/'+identifier)
+        if status!=200: raise SystemExit('Job read HTTP '+str(status)+'. Resume with '+identifier+' after resolving access; do not resubmit.')
+        envelope=decode(raw); job=envelope.get('job') if isinstance(envelope,dict) else None
+        if not isinstance(job,dict) or job.get('id')!=identifier or job.get('source')!='youtube_download' or job.get('status') not in ['pending','processing','completed','failed']:
+            raise ValueError('Unexpected job state; retain the original job ID')
+        # Do not persist job.params, job.error or other provider text: they can include storage details.
+        safe={k:job.get(k) for k in ['id','source','status','createdAt','updatedAt','progress','credits','durationMs','videoId']}
+        safe['checked_at']=datetime.now(timezone.utc).isoformat(); safe['poll_count']=attempt+1
+        save('state.json',safe)
+        if job['status'] in ('completed','failed'): break
+        if attempt<11: time.sleep(10)
+    emit(completed=safe['status']=='completed',job_id=identifier,status=safe['status'])
+  env:
+    FLASHDATA_API_KEY: '{{ secret(''FLASHDATA_API_KEY'') }}'
+  timeout: PT18M
+- id: route_delivery
+  type: io.kestra.plugin.core.flow.If
+  condition: '{{ outputs.poll_job.vars.completed }}'
+  then:
+  - id: delivery_manifest
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.13.15-slim
+    inputFiles:
+      state.json: '{{ outputs.poll_job.outputFiles[''state.json''] }}'
+    outputFiles:
+    - delivery.json
+    - delivery.md
+    script: |
+      import gzip
+      import http.client
+      import io
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+      from pathlib import Path
+      from urllib.parse import urlsplit
+
+      LIMIT=4*1024*1024
+      key=os.environ['FLASHDATA_API_KEY']
+      if not key or len(key)>512 or any(ord(c)<33 or ord(c)>126 for c in key): raise SystemExit('Configure a valid API key secret')
+      def request_http(host,path,method='GET',body=None,authenticated=True,correlation_id=None):
+          headers={'Accept':'application/json','Accept-Encoding':'gzip'}
+          if authenticated:
+              if host not in ('api.flashdata.dev','data.flashdata.dev'): raise ValueError('Refusing credentials to another host')
+              headers['X-API-Key']=key
+              if correlation_id: headers['X-Request-Id']=correlation_id
+          if body is not None: headers['Content-Type']='application/json'
+          conn=http.client.HTTPSConnection(host,timeout=65)
+          try:
+              conn.request(method,path,body=body,headers=headers)
+              res=conn.getresponse()
+              status=res.status; location=res.getheader('Location'); encoding=res.getheader('Content-Encoding')
+              raw=res.read(LIMIT+1)
+          except (OSError,http.client.HTTPException):
+              raise SystemExit('Network outcome uncertain. Inspect the saved request/job ID and FlashData Jobs before restarting; no retry was made.') from None
+          finally: conn.close()
+          if len(raw)>LIMIT: raise ValueError('Response exceeds 4 MiB')
+          if encoding=='gzip' or raw.startswith(b'\x1f\x8b'):
+              with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream: raw=stream.read(LIMIT+1)
+              if len(raw)>LIMIT: raise ValueError('Decoded response exceeds 4 MiB')
+          return status,location,raw
+
+      def decode(raw):
+          try: return json.loads(raw)
+          except (ValueError,UnicodeDecodeError): raise ValueError('Invalid JSON response; raw body withheld') from None
+
+      def save(name,value):
+          Path(name).write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding='utf-8')
+
+      def emit(**values):
+          print('::'+json.dumps({'outputs':values},separators=(',',':'))+'::',flush=True)
+
+      def job_id(value):
+          if not isinstance(value,str) or not re.fullmatch(r'job_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',value):
+              raise ValueError('Invalid job ID')
+          return value
+      state=decode(Path('state.json').read_bytes()); identifier=job_id(state['id'])
+      status,_,raw=request_http('api.flashdata.dev','/v2/api-access/')
+      metadata=decode(raw) if status==200 else {}
+      origin=metadata.get('result_origin') if isinstance(metadata,dict) else None
+      try:
+          trusted=urlsplit(origin or '')
+          if trusted.scheme!='https' or not trusted.hostname or trusted.username or trusted.password or trusted.path not in ('','/') or trusted.query or trusted.fragment or trusted.port not in (None,443): raise ValueError()
+      except ValueError: raise ValueError('Trusted result origin unavailable; do not follow an arbitrary download URL') from None
+      status,location,_=request_http('api.flashdata.dev','/v2/jobs/'+identifier+'/results')
+      if status!=302 or not isinstance(location,str): raise SystemExit('Result endpoint HTTP '+str(status)+'. Resume this job to refresh the manifest; no download was resubmitted.')
+      try:
+          target=urlsplit(location)
+          if target.scheme!='https' or target.hostname!=trusted.hostname or target.port not in (None,443) or target.username or target.password or target.fragment or any(ord(c)<=32 or ord(c)==127 for c in location): raise ValueError()
+      except ValueError: raise ValueError('Rejected untrusted result location') from None
+      status,_,raw=request_http(target.hostname,target.path+('?' +target.query if target.query else ''),authenticated=False)
+      if status!=200: raise SystemExit('Result storage HTTP '+str(status)+'. No redirect followed and no API key sent.')
+      result=decode(raw)
+      if not isinstance(result,dict) or not isinstance(result.get('results'),list) or len(result['results'])!=1 or not isinstance(result['results'][0],dict): raise ValueError('Unexpected delivery manifest')
+      item=result['results'][0]; url=item.get('file_url'); size=item.get('file_size')
+      try:
+          media=urlsplit(url or '')
+          if media.scheme!='https' or not media.hostname or media.username or media.password or any(ord(c)<=32 or ord(c)==127 for c in url): raise ValueError()
+          media.port
+      except (ValueError,TypeError): raise ValueError('Invalid delivery file URL') from None
+      if type(size) is not int or size<0: raise ValueError('Missing or invalid delivered file size')
+      save('delivery.json',{'job_id':identifier,'video_id':state.get('videoId'),'file_url':url,'file_size':size,'credits':state.get('credits'),'checked_at':state['checked_at'],'media_downloaded_by_flow':False})
+      Path('delivery.md').write_text('# Cloud delivery manifest\n\nJob: '+identifier+'\nDelivered bytes: '+str(size)+'\n\nOpen delivery.json for the customer-storage URL. This flow read only the result JSON; it did not fetch the media file. Treat returned URLs as sensitive execution artifacts.\n',encoding='utf-8')
+    env:
+      FLASHDATA_API_KEY: '{{ secret(''FLASHDATA_API_KEY'') }}'
+    timeout: PT5M
+  else:
+  - id: resume_instructions
+    type: io.kestra.plugin.core.storage.Write
+    extension: .md
+    content: Job {{ outputs.poll_job.vars.job_id }} is {{ outputs.poll_job.vars.status }}. For pending/processing,
+      rerun with this ID as resume_job_id; it only reads the existing job. For failed, inspect FlashData Jobs before
+      deciding on a new paid submission. This successful control flow does not mean delivery completed.
+extend:
+  title: YouTube cloud delivery manifests with FlashData
+  metaTitle: YouTube cloud delivery manifests with FlashData | Kestra
+  shortDescription: Deliver a short YouTube clip to customer-managed cloud storage and retain its delivery manifest
+    without downloading the media into Kestra.
+  metaDescription: Deliver authorized YouTube clips to customer storage, resume existing jobs and export a delivery
+    manifest with FlashData.
+  description: |
+    Deliver a short YouTube clip to customer-managed cloud storage and retain its delivery manifest without downloading the media into Kestra.
+
+    ## How it works
+
+    1. Validate a new clip or an existing job ID. An If branch submits exactly one asynchronous download or resumes without a POST.
+    2. Poll the existing job up to 12 times, ten seconds apart. Completed jobs enter manifest retrieval; pending, processing and failed jobs produce explicit recovery instructions.
+    3. Read the API's trusted result origin and follow only that result location without sending the API key. Read the JSON manifest, not the media file.
+
+    ## What you get
+
+    - prepare_request: request.json without storage credentials.
+    - submit_job: job.json; poll_job: state.json with status fields.
+    - delivery_manifest: delivery.json with file_url, file_size and usage; delivery.md.
+    - Otherwise resume_instructions.uri; a successful flow is not proof of completed delivery.
+
+    ## Who it's for
+
+    Media teams delivering authorized clips to their own storage who need resumable jobs and inspectable file metadata.
+
+    ## Why orchestrate this with Kestra
+
+    Separate submission, bounded polling and manifest retrieval. Resume an existing job rather than resubmitting an uncertain download.
+
+    ## Prerequisites
+
+    Kestra 2.0, Python plugin, Docker and HTTPS access to data.flashdata.dev, api.flashdata.dev and the trusted result-storage origin. Uses the Python standard library.
+    Create a [FlashData account and key](https://flashdata.dev/app/api-keys).
+    Installation is free; downloads are metered by bytes and storage-provider charges also apply. Check [pricing](https://flashdata.dev/pricing) and account limits; an initial zero estimate does not mean free service.
+
+    ### Secrets
+
+    - FLASHDATA_API_KEY with youtube_download access.
+    - FLASHDATA_STORAGE_JSON for new submissions: documented storage object containing storage_type, storage_url (bucket/container name), a dedicated object_prefix and provider credentials. Never use ordinary inputs. Resume runs do not require this secret.
+
+    ## Quick start
+
+    1. Configure secrets and rights to the selected video. For manual import omit the catalog-only extend block.
+    2. Use resume_job_id=new, an 11-character video_id and start_at/end_at. Defaults select a ten-second MP4 clip at up to 360p; this template caps duration at 60 seconds, not byte size or cost.
+    3. Save job.json. If polling ends early, rerun with its ID. Network timeouts have uncertain outcomes: inspect Jobs before any new submission. No POST is retried.
+    4. Protect execution artifacts containing file URLs. The weekly schedule is disabled; review recurring costs before enabling it.
+
+    ## How to extend
+
+    Attach downstream review to delivery.json. Expand duration only after reviewing byte limits and cost. HTTP timeout: 65 seconds. JSON limit: 4 MiB, including decompressed data.
+
+    ## Links
+
+    - [Download inputs and storage providers](https://flashdata.dev/docs/sources/youtube_download)
+    - [Kestra secrets](https://kestra.io/docs/how-to-guides/secrets)
+  tags:
+  - Data
+  subTags:
+  - File & Data Processing Basics
+  ee: false
+  demo: false
